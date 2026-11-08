@@ -1,6 +1,11 @@
 --[[
-    Cool Enhancements v1.5
-    5 ports from Splash base + wall check fix + rebrand
+    Cool Enhancements v1.6 — full build, Obsidian UI
+    Combat: aimbot (grace fix) · silent raycast · triggerbot (independent)
+    Movement: glue · tp walk · void pulse (v1.3)
+    Visuals: esp · damage numbers · hitsounds · stretched
+    Radar: radar overlay
+    Skins: unlock/equip
+    Settings: unload · rebuild
     Unload: getgenv().rivals.unload()
 --]]
 
@@ -20,8 +25,7 @@ local AssetService       = game:GetService("AssetService")
 
 local LocalPlayer        = Players.LocalPlayer
 local Camera             = Workspace.CurrentCamera
-
-local BRAND = "Cool Enhancements"
+local BRAND              = "Cool Enhancements"
 
 local function notify(title, text, dur)
     pcall(function()
@@ -34,6 +38,7 @@ local EX = { has = {
     getrawmeta    = type(getrawmetatable) == "function",
 } }
 
+-- MODULES
 local Mods = {}
 local function req(path, timeout)
     timeout = timeout or 10
@@ -74,7 +79,6 @@ end
 local TT = { live = {}, ALPHA_MIN = 0.15, ALPHA_MAX = 0.55 }
 local function ok_num(n) return n == n and math.abs(n) ~= math.huge end
 local function ok_vec(v) return v and ok_num(v.X) and ok_num(v.Y) and ok_num(v.Z) end
-
 local function read_cf(part)
     if not part then return nil end
     local ok, cf = pcall(function() return part.CFrame end)
@@ -91,7 +95,6 @@ local function read_cf(part)
     end
     return nil
 end
-
 local function tt_record(part, cf, now)
     if not part or not cf then return end
     local x, y, z = cf.X, cf.Y, cf.Z
@@ -116,13 +119,11 @@ local function tt_record(part, cf, now)
         live.x, live.y, live.z, live.t = x, y, z, now
     end
 end
-
 local function tt_best(part)
     local live = TT.live[part]
     if not live then local cf = read_cf(part) return cf and cf.Position end
     return Vector3.new(live.lkg_x, live.lkg_y, live.lkg_z)
 end
-
 local function tt_predict(part, ping, blend)
     blend = math.clamp(tonumber(blend) or 0, 0, 1)
     if blend <= 0.001 then return tt_best(part) end
@@ -136,7 +137,6 @@ local function tt_predict(part, ping, blend)
     if ok_vec(pred) then return pred end
     return pos
 end
-
 local function tt_ping()
     local ok, s = pcall(function() return game:GetService("Stats") end)
     if ok and s then
@@ -155,10 +155,9 @@ local function alive(c)
     return c:FindFirstChild("HumanoidRootPart") ~= nil
 end
 
--- PORT 2: ANTI-KATANA + ANTI-RIOT
+-- ANTI-KATANA + ANTI-RIOT
 local DeflectState = { by_player = {} }
 local RiotState    = { by_player = {} }
-
 do
     pcall(function()
         local ps = LocalPlayer:FindFirstChild("PlayerScripts")
@@ -180,7 +179,6 @@ do
             end
         end
     end)
-
     local function scan_riot()
         local vm = Workspace:FindFirstChild("ViewModels")
         if not vm then return end
@@ -192,11 +190,10 @@ do
     end
     track(RunService.Heartbeat:Connect(scan_riot))
 end
-
 local function is_deflecting(plr) return DeflectState.by_player[plr] == true end
 local function has_riot(plr) return RiotState.by_player[plr] == true end
 
--- AIMBOT STATE
+-- AIMBOT
 local AimState = {
     enabled=false, fov=120, smoothness=0.15, target_part="Head",
     wall_check=true, team_check=true, priority="Closest",
@@ -204,7 +201,8 @@ local AimState = {
     is_held=false, is_toggled=false,
     locked_target=nil, smooth_cf=nil, aim_curve="linear",
     predictive=5, fire_method="camera", show_fov_circle=true, override=nil,
-    _los_tick = 0,
+    _los_tick = 0, _los_fail_count = 0,
+    GRACE_FRAMES = 9, LOS_FAIL_THRESHOLD = 10,
 }
 
 local cam_controller
@@ -246,6 +244,241 @@ Combat.get_target = function(cfg)
                                     if mc then filter[#filter+1] = mc end
                                     if p.Character then filter[#filter+1] = p.Character end
                                     rp.FilterDescendantsInstances = filter
+                                    local hit = Workspace:Raycast(Camera.CFrame.Position, head.Position - Camera.CFrame.Position, rp)
+                                    if hit then los = false end
+                                end
+                                if los then
+                                    local score = (mypos - head.Position).Magnitude
+                                    if cfg.prefer_low_hp then
+                                        local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                                        if hum then score = score + hum.Health * 0.5 end
+                                    end
+                                    if score < best_score then best_score = score best = p end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function find_aim_target()
+    local myhrp = my_hrp()
+    if not myhrp then return nil end
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local myteam = LocalPlayer:GetAttribute("TeamID") or LocalPlayer.Team
+    local vs = cam.ViewportSize
+    local center_v = Vector2.new(vs.X / 2, vs.Y / 2)
+    local my_c = my_char()
+    local candidates = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and alive(p.Character) then
+            if not p.Character:FindFirstChildOfClass("ForceField") then
+                local theirteam = p:GetAttribute("TeamID") or p.Team
+                local same = myteam and theirteam and myteam == theirteam
+                if not (AimState.team_check and same) then
+                    if not is_deflecting(p) and not has_riot(p) then
+                        local part = p.Character:FindFirstChild(AimState.target_part) or p.Character:FindFirstChild("Head")
+                        if part then
+                            local v, on = cam:WorldToViewportPoint(part.Position)
+                            if on and v.Z > 0 then
+                                local dx = v.X - center_v.X
+                                local dy = v.Y - center_v.Y
+                                local sd = math.sqrt(dx*dx + dy*dy)
+                                if sd <= AimState.fov then
+                                    local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                                    local score = sd
+                                    if AimState.priority == "LowestHP" and hum then
+                                        score = hum.Health * 10 + sd * 0.1
+                                    elseif AimState.priority == "Closest" then
+                                        score = (myhrp.Position - part.Position).Magnitude
+                                    end
+                                    candidates[#candidates+1] = { head = part, char = p.Character, score = score }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if #candidates == 0 then return nil end
+    table.sort(candidates, function(a,b) return a.score < b.score end)
+    if not AimState.wall_check then return candidates[1].head end
+    local cam_pos = cam.CFrame.Position
+    for _, c in ipairs(candidates) do
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        rp.IgnoreWater = true
+        local filter = {}
+        if my_c then filter[#filter+1] = my_c end
+        if c.char then filter[#filter+1] = c.char end
+        rp.FilterDescendantsInstances = filter
+        local hit = Workspace:Raycast(cam_pos, c.head.Position - cam_pos, rp)
+        if not hit then return c.head end
+    end
+    return nil
+end
+
+local function target_has_los(part)
+    if not part or not part.Parent then return false end
+    local cam = Workspace.CurrentCamera
+    if not cam then return false end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.IgnoreWater = true
+    local filter = {}
+    local mc = my_char()
+    if mc then filter[#filter+1] = mc end
+    if part.Parent then filter[#filter+1] = part.Parent end
+    rp.FilterDescendantsInstances = filter
+    local hit = Workspace:Raycast(cam.CFrame.Position, part.Position - cam.CFrame.Position, rp)
+    return hit == nil
+end
+
+local function aim_step(dt)
+    if AimState.override then pcall(AimState.override, dt) return end
+    if not AimState.enabled then AimState.smooth_cf = nil return end
+    local should
+    if AimState.method == "Always" then should = true
+    elseif AimState.method == "Toggle" then should = AimState.is_toggled
+    else should = AimState.is_held end
+    if not should then AimState.smooth_cf = nil return end
+
+    local part = AimState.locked_target
+    AimState._los_tick = (AimState._los_tick or 0) + 1
+
+    local invalid = false
+    if part then
+        if not part.Parent or not alive(part.Parent) then
+            invalid = true
+        elseif AimState.wall_check and AimState._los_tick % 10 == 0 then
+            if not target_has_los(part) then
+                AimState._los_fail_count = (AimState._los_fail_count or 0) + 1
+                if AimState._los_fail_count >= AimState.LOS_FAIL_THRESHOLD then
+                    invalid = true
+                    AimState._los_fail_count = 0
+                end
+            else
+                AimState._los_fail_count = 0
+            end
+        end
+    end
+    if invalid then
+        AimState.locked_target = nil
+        part = nil
+    end
+
+    if not part then
+        part = find_aim_target()
+        AimState.locked_target = part
+    end
+    if not part then return end
+
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local blend = AimState.predictive / 100
+    local aim_pos = tt_predict(part, tt_ping(), blend) or part.Position
+    local origin = cam.CFrame.Position
+    local look = CFrame.lookAt(origin, aim_pos)
+
+    if not AimState.smooth_cf then
+        AimState.smooth_cf = look
+    else
+        local smooth = math.clamp(tonumber(AimState.smoothness) or 0.15, 0.02, 20)
+        local speed = 6 / smooth
+        local alpha
+        if AimState.aim_curve == "linear" then alpha = math.clamp(speed*dt, 0, 1)
+        elseif AimState.aim_curve == "ease" then local t = math.clamp(speed*dt, 0, 1) alpha = t*t*(3-2*t)
+        else alpha = 1 - math.exp(-(4/smooth)*dt) end
+        AimState.smooth_cf = AimState.smooth_cf:Lerp(look, alpha)
+    end
+
+    if cam_controller and cam_controller.MimicRotation then
+        pcall(function() cam_controller:MimicRotation(AimState.smooth_cf) end)
+    else
+        pcall(function() cam.CFrame = AimState.smooth_cf end)
+    end
+end
+
+local AIM_BIND = "ce_aim"
+function AimState.set_enabled(v)
+    AimState.enabled = v
+    if v then
+        pcall(function()
+            RunService:UnbindFromRenderStep(AIM_BIND)
+            RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, aim_step)
+        end)
+    else
+        pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
+        AimState.locked_target = nil
+        AimState.smooth_cf = nil
+    end
+end
+
+local GRACE_BIND = "ce_aim_grace"
+local _grace_last_good = nil
+local _grace_last_tick = 0
+pcall(function() RunService:UnbindFromRenderStep(GRACE_BIND) end)
+RunService:BindToRenderStep(GRACE_BIND, Enum.RenderPriority.Camera.Value + 2, function()
+    if not AimState.enabled then _grace_last_good = nil return end
+    local should
+    if AimState.method == "Always" then should = true
+    elseif AimState.method == "Toggle" then should = AimState.is_toggled
+    else should = AimState.is_held end
+    if not should then _grace_last_good = nil return end
+    local current = AimState.locked_target
+    if current then
+        _grace_last_good = current
+        _grace_last_tick = tick()
+        return
+    end
+    if _grace_last_good and (tick() - _grace_last_tick) < (AimState.GRACE_FRAMES / 60) then
+        if _grace_last_good.Parent then
+            local hum = _grace_last_good.Parent:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                AimState.locked_target = _grace_last_good
+                return
+            end
+        end
+    end
+end)
+
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == AimState.keybind_key then
+        if AimState.method == "Keybind" then AimState.is_held = true AimState.smooth_cf = nil end
+        if AimState.method == "Toggle" and not AimState.is_toggled then AimState.is_toggled = true AimState.smooth_cf = nil
+        elseif AimState.method == "Toggle" then AimState.is_toggled = false end
+    end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == AimState.keybind_key and AimState.method == "Keybind" then AimState.is_held = false end
+end))
+
+local fov_circle = Drawing.new("Circle")
+fov_circle.Thickness = 1.5
+fov_circle.NumSides = 64
+fov_circle.Filled = false
+fov_circle.Visible = false
+fov_circle.Color = Color3.fromRGB(255, 255, 255)
+track(RunService.RenderStepped:Connect(function()
+    if not AimState.enabled or not AimState.show_fov_circle then
+        fov_circle.Visible = false
+        return
+    end
+    local cam = workspace.CurrentCamera
+    if not cam then fov_circle.Visible = false return end
+    local vs = cam.ViewportSize
+    fov_circle.Position = Vector2.new(vs.X / 2, vs.Y / 2)
+    fov_circle.Radius = AimState.fov
+    fov_circle.Visible = true
+end))
+track(function() pcall(funct                rp.FilterDescendantsInstances = filter
                                     local hit = Workspace:Raycast(Camera.CFrame.Position, head.Position - Camera.CFrame.Position, rp)
                                     if hit then los = false end
                                 end
